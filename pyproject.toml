@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "audio-sdk"
+version = "0.1.0"
+description = ""
+authors = ["chikara <chikatana2001@gmail.com>"]
+readme = "README.md"
+packages = [{include = "audio_sdk", from = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.13,<4.0.0"
+openai-agents = {version = ">=0.0.15,<0.0.16", extras = ["voice"]}
+pydantic = ">=2.11.4,<3.0.0"
+sounddevice = ">=0.5.1,<0.6.0"
+textual = {version = ">=3.2.0,<4.0.0", python = ">=3.13,<4.0.0"}
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
