@@ -44,8 +44,7 @@ PRODUCTS_LIST = [
 ### CONTEXT
 
 class CallCenterAgentContext(BaseModel):
-    user_name: str | None = None
-    product_name: str | None = None
+    customer_name: str | None = None
     question_type: str | None = None
 
 
@@ -74,22 +73,20 @@ async def faq_lookup_tool(question: str) -> str:
 
 
 @function_tool
-async def update_seat(
-    context: RunContextWrapper[CallCenterAgentContext], confirmation_number: str, new_seat: str
-) -> str:
+async def update_customer_info(
+    context: RunContextWrapper[CallCenterAgentContext], customer_name: str, question_type: str
+) -> None:
     """
-    Update the seat for a given confirmation number.
+    Update the customer information.
 
     Args:
-        confirmation_number: The confirmation number for the flight.
-        new_seat: The new seat to update to.
+        customer_name: The name of the customer.
+        question_type: The type of question being asked.
     """
     # Update the context based on the customer's input
-    context.context.confirmation_number = confirmation_number
-    context.context.seat_number = new_seat
-    # Ensure that the flight number has been set by the incoming handoff
-    assert context.context.flight_number is not None, "Flight number is required"
-    return f"Updated seat to {new_seat} for confirmation number {confirmation_number}"
+    context.context.customer_name = customer_name
+    context.context.question_type = question_type
+
 
 ### Guardrails
 
@@ -158,6 +155,22 @@ async def main():
             }
         ) as slack_file_mcp_server:
 
+            error_trouble_agent = Agent[CallCenterAgentContext](
+                name="エラー・トラブル・クレーム対応エージェント",
+                instructions=f"""{JA_RECOMMENDED_PROMPT_PREFIX}
+                あなたはエラー・トラブル・クレーム対応エージェントです。もし顧客と話している場合、あなたはおそらくトリアージエージェントから仕事を委譲されました。
+                コールセンターマニュアルと、以下のルーチンに従って顧客の質問に対応してください。
+                # ルーチン
+                1. 顧客がどの商品の、どのようなエラーやトラブルについて質問しているかを確認します。クレームであれば、どのようなクレームかを確認し、マニュアルに従って対応してください。
+                2. 特定の商品に関するものである場合、file_mcp_serverで提供されているディレクトリのファイルの中に、一致するテキストファイルがあるかどうかを確認します。
+                3. ある場合、そのテキストファイルの中から、顧客の質問に答えられる情報を抽出し、回答してください。質問の内容が答えれらない場合は、「申し訳ありませんが、それついてはお答えできません。」と伝えます。
+                4. サポートセンターの電話番号やメールアドレスが書かれている場合は、顧客にその情報を伝え、Slackのチャンネルにその内容を送信してください。
+                5. ない場合、「申し訳ありませんが、そのエラーやトラブルについてはお答えできません。」と伝えます。
+                もし顧客がルーチンに関連しない質問をした場合、トリアージエージェントに引き継ぎます。
+                """,
+                mcp_servers=[file_mcp_server, slack_file_mcp_server],
+            )
+
             how_to_agent = Agent[CallCenterAgentContext](
                 name="商品取り扱いエージェント",
                 handoff_description="商品取り扱いエージェントは、商品に関する質問に答えることができます。",
@@ -190,12 +203,13 @@ async def main():
                 """,
                 mcp_servers=[file_mcp_server, slack_file_mcp_server],
             )
-            
+
             triage_agent = Agent[CallCenterAgentContext](
                 name="トリアージエージェント",
                 instructions=(
                     f"{JA_RECOMMENDED_PROMPT_PREFIX} "
                     "あなたは優秀なトリアージエージェントです。 あなたは、顧客のリクエストを適切なエージェントに委任することができます。\n"
+                    "顧客の名前より先に質問が来た場合、質問を記憶しつつ、名前を聞き、update_customer_infoを呼び出してください。\n"
                     "顧客の質問は、以下の3つのカテゴリに分けられます。\n"
                     "1. 商品の取り扱いに関する質問\n"
                     "2. 商品の注文・購入に関する質問\n"
@@ -207,11 +221,16 @@ async def main():
                 handoffs=[
                     how_to_agent,
                     order_agent,
+                    error_trouble_agent,
                 ],
                 input_guardrails=[abnormal_guardrail],
+                tools=[update_customer_info],
             )
+
+            # 再びトリアージエージェントに戻るためのハンドオフ
             order_agent.handoffs.append(triage_agent)
             how_to_agent.handoffs.append(triage_agent)
+            error_trouble_agent.handoffs.append(triage_agent)
             
             current_agent: Agent[CallCenterAgentContext] = triage_agent
             input_items: list[TResponseInputItem] = []
