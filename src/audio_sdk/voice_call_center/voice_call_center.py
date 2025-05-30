@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+import shutil
 
-import numpy as np
 import sounddevice as sd
 from agents.voice import StreamedAudioInput, StreamedAudioResult, VoicePipeline
+from config import CHANNELS, FORMAT, SAMPLE_RATE
+from dotenv import load_dotenv
+from my_workflow import VoiceCallCenterWorkflow
 from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Container
@@ -13,34 +15,19 @@ from textual.reactive import reactive
 from textual.widgets import Button, RichLog, Static
 from typing_extensions import override
 
-# Import MyWorkflow class - handle both module and package use cases
-if TYPE_CHECKING:
-    # For type checking, use the relative import
-    from .my_workflow import MyWorkflow
-else:
-    # At runtime, try both import styles
-    try:
-        # Try relative import first (when used as a package)
-        from .my_workflow import MyWorkflow
-    except ImportError:
-        # Fall back to direct import (when run as a script)
-        from my_workflow import MyWorkflow
+load_dotenv()
 
-CHUNK_LENGTH_S = 0.05  # 100ms
-SAMPLE_RATE = 24000
-FORMAT = np.int16
-CHANNELS = 1
-
+# UI Components
 
 class Header(Static):
     """A header widget."""
 
     session_id = reactive("")
+    current_agent = reactive("音声コールセンター | 現在のエージェント: トリアージエージェント")
 
     @override
     def render(self) -> str:
-        return "Speak to the agent. When you stop speaking, it will respond."
-
+        return f"音声コールセンター | 現在のエージェント: {self.current_agent}"
 
 class AudioStatusIndicator(Static):
     """A widget that shows the current audio recording status."""
@@ -50,14 +37,15 @@ class AudioStatusIndicator(Static):
     @override
     def render(self) -> str:
         status = (
-            "🔴 Recording... (Press K to stop)"
+            "🔴 録音中... (Kキーで停止)"
             if self.is_recording
-            else "⚪ Press K to start recording (Q to quit)"
+            else "⚪ Kキーで録音開始 (Qキーで終了)"
         )
         return status
 
+# Main Application
 
-class RealtimeApp(App[None]):
+class VoiceCallCenterApp(App[None]):
     CSS = """
         Screen {
             background: #1a1b26;  /* Dark blue-grey background */
@@ -125,13 +113,12 @@ class RealtimeApp(App[None]):
         self.last_audio_item_id = None
         self.should_send_audio = asyncio.Event()
         self.connected = asyncio.Event()
-        self.pipeline = VoicePipeline(
-            workflow=MyWorkflow(
-                secret_word="dog",
-                on_start=self._on_transcription,
-                tts_output=self._tts_output,
-            ),
+        self.workflow = VoiceCallCenterWorkflow(
+            on_start=self._on_transcription,
+            tts_output=self._tts_output,
+            on_agent_change=self._on_agent_change,
         )
+        self.pipeline = VoicePipeline(workflow=self.workflow)
         self._audio_input = StreamedAudioInput()
         self.audio_player = sd.OutputStream(
             samplerate=SAMPLE_RATE,
@@ -142,14 +129,22 @@ class RealtimeApp(App[None]):
     def _on_transcription(self, transcription: str) -> None:
         try:
             self.query_one("#bottom-pane", RichLog).write(
-                f"Transcription: {transcription}"
+                f"音声認識: {transcription}"
             )
         except Exception:
             pass
 
     def _tts_output(self, text: str) -> None:
         try:
-            self.query_one("#bottom-pane", RichLog).write(f"API Output: {text}")
+            self.query_one("#bottom-pane", RichLog).write(f"エージェント応答: {text}")
+        except Exception:
+            pass
+
+    def _on_agent_change(self, agent_name: str) -> None:
+        try:
+            header = self.query_one("#session-display", Header)
+            header.current_agent = agent_name
+            self.query_one("#bottom-pane", RichLog).write(f"🔄 エージェント切り替え: {agent_name}")
         except Exception:
             pass
 
@@ -171,18 +166,19 @@ class RealtimeApp(App[None]):
             self.result: StreamedAudioResult = await self.pipeline.run(
                 self._audio_input
             )
-            # StreamedAudioResult.stream()によって、音声データに変換される
             async for event in self.result.stream():
                 bottom_pane = self.query_one("#bottom-pane", RichLog)
                 if event.type == "voice_stream_event_audio":
                     self.audio_player.write(event.data)  # Play the audio
                 elif event.type == "voice_stream_event_lifecycle":
-                    bottom_pane.write(f"Lifecycle event: {event.event}")
+                    bottom_pane.write(f"ライフサイクルイベント: {event.event}")
         except Exception as e:
             bottom_pane = self.query_one("#bottom-pane", RichLog)
-            bottom_pane.write(f"Error: {e}")
+            bottom_pane.write(f"エラー: {e}")
         finally:
             self.audio_player.close()
+            # クリーンアップ
+            await self.workflow.cleanup()
 
     async def send_mic_audio(self) -> None:
         device_info = sd.query_devices()
@@ -225,6 +221,7 @@ class RealtimeApp(App[None]):
             return
 
         if event.key == "q":
+            await self.workflow.cleanup() # クリーンアップしてから終了
             self.exit()
             return
 
@@ -237,7 +234,8 @@ class RealtimeApp(App[None]):
                 self.should_send_audio.set()
                 status_indicator.is_recording = True
 
-
 if __name__ == "__main__":
-    app = RealtimeApp()
+    if not shutil.which("npx"):
+        raise RuntimeError("npx is not installed. Please install it with `npm install -g npx`.")
+    app = VoiceCallCenterApp()
     app.run()

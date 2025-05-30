@@ -1,76 +1,27 @@
-from __future__ import annotations as _annotations
+from __future__ import annotations
 
-import asyncio
 import os
-import random
-import shutil
 import uuid
+from collections.abc import AsyncIterator
+from typing import Callable
 
-from agents import (Agent, GuardrailFunctionOutput, HandoffOutputItem,
-                    InputGuardrailTripwireTriggered, ItemHelpers,
-                    MessageOutputItem, RunContextWrapper, Runner, ToolCallItem,
-                    ToolCallOutputItem, TResponseInputItem, function_tool,
-                    handoff, input_guardrail, trace)
-from agents.mcp import MCPServer, MCPServerSse, MCPServerStdio
-from dotenv import load_dotenv
+from agents import (Agent, GuardrailFunctionOutput,
+                    InputGuardrailTripwireTriggered, RunContextWrapper, Runner,
+                    TResponseInputItem, function_tool, input_guardrail, trace)
+from agents.mcp import MCPServerStdio
+from agents.voice import VoiceWorkflowBase, VoiceWorkflowHelper
+from config import JA_RECOMMENDED_PROMPT_PREFIX, MODEL, CallCenterAgentContext
 from pydantic import BaseModel, Field
 
-load_dotenv()
+# コールセンターマニュアルの読み込み
 
-MODEL = "gpt-4o-mini"
-JA_RECOMMENDED_PROMPT_PREFIX = """
-#システムコンテキスト\n
-あなたは、エージェントの協調と実行を簡単にするために設計されたマルチエージェントシステム「Agents SDK」の一部です。
-Agentsは主に2つの抽象概念、**Agent**と**Handoffs**を使用します。エージェントは指示とツールを含み、適切なタイミングで会話を他のエージェントに引き継ぐことができます。
-ハンドオフは通常 transfer_to_<agent_name> という名前のハンドオフ関数を呼び出すことで実現されます。エージェント間の引き継ぎはバックグラウンドでシームレスに処理されます。
-ユーザーとの会話の中で、これらの引き継ぎについて言及したり、注意を引いたりしないでください。\n"""
+try:
+    with open("data/call_center_manual.txt", "r", encoding="utf-8") as f:
+        CALL_CENTER_MANUAL = f.read()
+except FileNotFoundError:
+    CALL_CENTER_MANUAL = "コールセンターマニュアルが見つかりません。"
 
-with open("../../../data/call_center_manual.txt", "r", encoding="utf-8") as f:
-    CALL_CENTER_MANUAL = f.read()
-
-PRODUCTS_LIST = [
-    "タブレット A68 Air", 
-    "スマートウォッチ B27 Max", 
-    "スマートフォン C82 Lite", 
-    "スマートスピーカー D47 Air",
-    "スマートフォン E51 Mini",
-    "スマートスピーカー F29 Pro",
-    "スマートフォン G81 Standard",
-    "ワイヤレスイヤホン H61 Air",
-    "ワイヤレスイヤホン I79 Pro",
-    "ゲーム機 J87 Max"
-    ]
-
-### CONTEXT
-
-class CallCenterAgentContext(BaseModel):
-    customer_name: str | None = None
-    question_type: str | None = None
-
-
-### TOOLS
-#### MCP: products info lookup, slack summary notification
-
-@function_tool(
-    name_override="faq_lookup_tool", description_override="よく聞かれる質問を調べるツール"
-)
-async def faq_lookup_tool(question: str) -> str:
-    if "bag" in question or "baggage" in question:
-        return (
-            "You are allowed to bring one bag on the plane. "
-            "It must be under 50 pounds and 22 inches x 14 inches x 9 inches."
-        )
-    elif "seats" in question or "plane" in question:
-        return (
-            "There are 120 seats on the plane. "
-            "There are 22 business class seats and 98 economy seats. "
-            "Exit rows are rows 4 and 16. "
-            "Rows 5-8 are Economy Plus, with extra legroom. "
-        )
-    elif "wifi" in question:
-        return "We have free wifi on the plane, join Airline-Wifi"
-    return "I'm sorry, I don't know the answer to that question."
-
+# TOOLS
 
 @function_tool
 async def update_customer_info(
@@ -87,8 +38,7 @@ async def update_customer_info(
     context.context.customer_name = customer_name
     context.context.question_type = question_type
 
-
-### Guardrails
+# Guardrails
 
 class AbnormalOutput(BaseModel):
     reasoning: str | None = Field(
@@ -98,7 +48,12 @@ class AbnormalOutput(BaseModel):
 
 guardrail_agent = Agent(
     name="Guardrail check",
-    instructions="ユーザからの質問が与えられる。ユーザーがコールセンターにしないようなアブノーマルな質問をしているかどうかを確認しろ。",
+    instructions=(
+        "カスタマーがコールセンターにしないような質問をしているかどうかを確認してください。"
+        "例えば、「あなたの好きな色は何ですか？」や「あなたの趣味は何ですか？」などの質問は、コールセンターにするべきではありません。"
+        "他にも「210たす4は？」といった計算問題や、「今日の経済ニュースは？」といった一般的な雑談もコールセンターにするべきではありません。"
+        "このような質問を見つけたら、is_abnormalをTrueにしてください。"
+    ),
     output_type=AbnormalOutput,
     model=MODEL,
 )
@@ -118,45 +73,68 @@ async def abnormal_guardrail(
         tripwire_triggered=final_output.is_abnormal,
     )
 
-### HOOKS
+# Voice Call Center Workflow
+class VoiceCallCenterWorkflow(VoiceWorkflowBase):
+    def __init__(self, on_start: Callable[[str], None], tts_output: Callable[[str], None], on_agent_change: Callable[[str], None] = None):
+        """
+        Args:
+            on_start: A callback that is called when the workflow starts. The transcription
+                is passed in as an argument.
+            tts_output: A callback that is called when the TTS output is generated.
+            on_agent_change: A callback that is called when the agent changes.
+        """
+        self._input_history: list[TResponseInputItem] = []
+        self._context = CallCenterAgentContext()
+        self._conversation_id = uuid.uuid4().hex[:16]
+        self._on_start = on_start
+        self._tts_output = tts_output
+        self._on_agent_change = on_agent_change
+        self._current_agent = None
+        self._agents_initialized = False
 
-async def on_seat_booking_handoff(context: RunContextWrapper[CallCenterAgentContext]) -> None:
-    flight_number = f"FLT-{random.randint(100, 999)}"
-    context.context.flight_number = flight_number
+    async def _initialize_agents(self):
+        """MCPサーバーを初期化してエージェントを設定"""
+        if self._agents_initialized:
+            return
 
-### RUN
-
-async def main():
-    async with MCPServerStdio(
-        name="Filesystem Server, via npx",
-        params={
-            "command": "npx",
-            "args": [
-                "-y", 
-                "@modelcontextprotocol/server-filesystem", 
-                "/Users/chikaratanaka/Documents/audio_sdk/data/products"
-                ]
-        }
-    ) as file_mcp_server:
-        
-        async with MCPServerStdio(
-            name="SSE Slack API Server",
-            params={
-                "command": "npx",
-                "args": [
-                    "-y", 
-                    "@modelcontextprotocol/server-slack"
-                ],
-                "env": {
-                    "SLACK_BOT_TOKEN": os.environ.get("SLACK_BOT_TOKEN"),
-                    "SLACK_TEAM_ID": os.environ.get("SLACK_TEAM_ID"),
-                    "SLACK_CHANNEL_IDS": os.environ.get("SLACK_CHANNEL_ID"),
+        try:
+            # MCPサーバーの初期化
+            self.file_mcp_server = MCPServerStdio(
+                name="Filesystem Server, via npx",
+                params={
+                    "command": "npx",
+                    "args": [
+                        "-y", 
+                        "@modelcontextprotocol/server-filesystem", 
+                        "/Users/chikaratanaka/Documents/audio_sdk/data/products"
+                    ]
                 }
-            }
-        ) as slack_file_mcp_server:
+            )
+            
+            self.slack_mcp_server = MCPServerStdio(
+                name="SSE Slack API Server",
+                params={
+                    "command": "npx",
+                    "args": [
+                        "-y", 
+                        "@modelcontextprotocol/server-slack"
+                    ],
+                    "env": {
+                        "SLACK_BOT_TOKEN": os.environ.get("SLACK_BOT_TOKEN"),
+                        "SLACK_TEAM_ID": os.environ.get("SLACK_TEAM_ID"),
+                        "SLACK_CHANNEL_IDS": os.environ.get("SLACK_CHANNEL_ID"),
+                    }
+                }
+            )
 
-            error_trouble_agent = Agent[CallCenterAgentContext](
+            # MCPサーバーを開始
+            await self.file_mcp_server.__aenter__()
+            await self.slack_mcp_server.__aenter__()
+
+            # エージェントの初期化
+            self.error_trouble_agent = Agent[CallCenterAgentContext](
                 name="エラー・トラブル・クレーム対応エージェント",
+                handoff_description="エラー・トラブル・クレーム対応エージェントは、商品のエラーやトラブル、クレームに関する質問に対応できます。",
                 instructions=f"""{JA_RECOMMENDED_PROMPT_PREFIX}
                 あなたはエラー・トラブル・クレーム対応エージェントです。もし顧客と話している場合、あなたはおそらくトリアージエージェントから仕事を委譲されました。
                 コールセンターマニュアルと、以下のルーチンに従って顧客の質問に対応してください。
@@ -168,10 +146,10 @@ async def main():
                 5. ない場合、「申し訳ありませんが、そのエラーやトラブルについてはお答えできません。」と伝えます。
                 もし顧客がルーチンに関連しない質問をした場合、トリアージエージェントに引き継ぎます。
                 """,
-                mcp_servers=[file_mcp_server, slack_file_mcp_server],
+                mcp_servers=[self.file_mcp_server, self.slack_mcp_server],
             )
 
-            how_to_agent = Agent[CallCenterAgentContext](
+            self.how_to_agent = Agent[CallCenterAgentContext](
                 name="商品取り扱いエージェント",
                 handoff_description="商品取り扱いエージェントは、商品に関する質問に答えることができます。",
                 instructions=f"""{JA_RECOMMENDED_PROMPT_PREFIX}
@@ -184,11 +162,10 @@ async def main():
                 4. ない場合、「申し訳ありませんが、その商品は取り扱っておりません。」と伝えます。
                 もし顧客がルーチンに関連しない質問をした場合、トリアージエージェントに引き継ぎます。
                 """,
-                mcp_servers=[file_mcp_server],
+                mcp_servers=[self.file_mcp_server],
             )
 
-
-            order_agent = Agent[CallCenterAgentContext](
+            self.order_agent = Agent[CallCenterAgentContext](
                 name="商品注文・購入対応エージェント",
                 handoff_description="商品注文・購入に関する質問に答えるエージェントです。",
                 instructions=f"""{JA_RECOMMENDED_PROMPT_PREFIX}
@@ -201,14 +178,15 @@ async def main():
                 4. ない場合、「申し訳ありませんが、その商品は取り扱っておりません。」と伝えます。少しだけでも似ている名前の商品がある場合は、「<似ている商品名>はありますが、<商品名>はありません。」と伝えます。
                 もし顧客がルーチンに関連しない質問をした場合、トリアージエージェントに引き継ぎます。
                 """,
-                mcp_servers=[file_mcp_server, slack_file_mcp_server],
+                mcp_servers=[self.file_mcp_server, self.slack_mcp_server],
             )
 
-            triage_agent = Agent[CallCenterAgentContext](
+            self.triage_agent = Agent[CallCenterAgentContext](
                 name="トリアージエージェント",
                 instructions=(
                     f"{JA_RECOMMENDED_PROMPT_PREFIX} "
                     "あなたは優秀なトリアージエージェントです。 あなたは、顧客のリクエストを適切なエージェントに委任することができます。\n"
+                    "顧客の質問がコールセンターにしないような質問をしているかもしれない場合は、ガードレールエージェントを使用してください。\n"
                     "顧客の名前より先に質問が来た場合、質問を記憶しつつ、名前を聞き、update_customer_infoを呼び出してください。\n"
                     "顧客の質問は、以下の3つのカテゴリに分けられます。\n"
                     "1. 商品の取り扱いに関する質問\n"
@@ -219,58 +197,87 @@ async def main():
                     f"{CALL_CENTER_MANUAL}\n"
                 ),
                 handoffs=[
-                    how_to_agent,
-                    order_agent,
-                    error_trouble_agent,
+                    self.how_to_agent,
+                    self.order_agent,
+                    self.error_trouble_agent,
                 ],
                 input_guardrails=[abnormal_guardrail],
                 tools=[update_customer_info],
             )
 
             # 再びトリアージエージェントに戻るためのハンドオフ
-            order_agent.handoffs.append(triage_agent)
-            how_to_agent.handoffs.append(triage_agent)
-            error_trouble_agent.handoffs.append(triage_agent)
+            self.order_agent.handoffs.append(self.triage_agent)
+            self.how_to_agent.handoffs.append(self.triage_agent)
+            self.error_trouble_agent.handoffs.append(self.triage_agent)
             
-            current_agent: Agent[CallCenterAgentContext] = triage_agent
-            input_items: list[TResponseInputItem] = []
-            context = CallCenterAgentContext()
+            self._current_agent = self.triage_agent
+            self._agents_initialized = True
 
-            conversation_id = uuid.uuid4().hex[:16]
-            while True:
-                user_input = input("Enter your message: ")
-                if user_input.lower() in ["q", "quit"]:
-                    print("Exiting...")
-                    break
-                with trace("Customer service", group_id=conversation_id):
-                    input_items.append({"content": user_input, "role": "user"})
-                    try:
-                        print(f"context: {context}")
-                        result = await Runner.run(current_agent, input_items, context=context)
-                        for new_item in result.new_items:
-                            agent_name = new_item.agent.name
-                            if isinstance(new_item, MessageOutputItem):
-                                print(f"{agent_name}: {ItemHelpers.text_message_output(new_item)}")
-                            elif isinstance(new_item, HandoffOutputItem):
-                                print(
-                                    f"Handed off from {new_item.source_agent.name} to {new_item.target_agent.name}"
-                                )
-                            elif isinstance(new_item, ToolCallItem):
-                                print(f"{agent_name}: Calling a tool")
-                            elif isinstance(new_item, ToolCallOutputItem):
-                                # print(f"{agent_name}: Tool call output: {new_item.output}")
-                                pass
-                            else:
-                                print(f"{agent_name}: Skipping item: {new_item.__class__.__name__}")
+        except Exception as e:
+            print(f"エージェント初期化エラー: {e}")
 
-                            input_items = result.to_input_list()
-                            current_agent = result.last_agent
+    async def run(self, transcription: str) -> AsyncIterator[str]:
+        self._on_start(transcription)
 
-                    except InputGuardrailTripwireTriggered as e:
-                        message= "すみません。この質問にはお答えできません。"
-                        print(f"{current_agent.name}: {message}")
+        # エージェントの初期化(基本的には一度だけ)
+        await self._initialize_agents()
 
-if __name__ == "__main__":
-    if not shutil.which("npx"):
-        raise RuntimeError("npx is not installed. Please install it with `npm install -g npx`.")
-    asyncio.run(main())
+        # Add the transcription to the input history
+        self._input_history.append(
+            {
+                "role": "user",
+                "content": transcription,
+            }
+        )
+
+        try:
+            with trace("Customer service", group_id=self._conversation_id):
+                # Run the agent
+                result = Runner.run_streamed(self._current_agent, self._input_history, context=self._context)
+                full_response = ""
+                async for chunk in VoiceWorkflowHelper.stream_text_from(result):
+                    full_response += chunk
+                    yield chunk
+                
+                self._tts_output(full_response)
+                
+                # Update the input history and current agent
+                self._input_history = result.to_input_list()
+                if self._current_agent != result.last_agent:
+                    self._current_agent = result.last_agent
+                    if self._on_agent_change:
+                        self._on_agent_change(self._current_agent.name)
+
+        except InputGuardrailTripwireTriggered as e:
+            message = "すみません。この質問にはお答えできません。"
+            self._tts_output(message)
+            # ガードレール作動の通知
+            if self._on_agent_change:
+                self._on_agent_change("ガードレール作動")
+
+            self._input_history.append(
+                {
+                    "role": "assistant",
+                    "content": message,
+                }
+            )
+            self._current_agent = self.triage_agent
+            if self._on_agent_change:
+                self._on_agent_change(self._current_agent.name)
+
+            yield message
+            
+        except Exception as e:
+            error_message = f"申し訳ありません。システムエラーが発生しました: {str(e)}"
+            self._tts_output(error_message)
+            yield error_message
+
+    async def cleanup(self):
+        """リソースのクリーンアップ"""
+        try:
+            if hasattr(self, 'file_mcp_server'):
+                await self.file_mcp_server.__aexit__(None, None, None)
+            if hasattr(self, 'slack_mcp_server'):
+                await self.slack_mcp_server.__aexit__(None, None, None)
+        except Exception as e:
+            print(f"クリーンアップエラー: {e}")
