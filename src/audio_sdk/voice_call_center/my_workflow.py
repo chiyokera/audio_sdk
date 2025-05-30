@@ -106,7 +106,7 @@ class VoiceCallCenterWorkflow(VoiceWorkflowBase):
                     "args": [
                         "-y", 
                         "@modelcontextprotocol/server-filesystem", 
-                        "/Users/chikaratanaka/Documents/audio_sdk/data/products"
+                        "/Users/hoge/audio_sdk/data/products"
                     ]
                 }
             )
